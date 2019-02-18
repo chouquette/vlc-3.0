@@ -30,6 +30,9 @@ endif
 ifdef HAVE_MACOSX
 	$(APPLY) $(SRC)/gnutls/gnutls-disable-connectx-macos.patch
 endif
+ifdef HAVE_WINSTORE
+	$(APPLY) $(SRC)/gnutls/winstore.patch
+endif
 	$(call pkg_static,"lib/gnutls.pc.in")
 	$(UPDATE_AUTOCONFIG)
 	$(MOVE)

@@ -1,0 +1,551 @@
+--- gnutls/gl/stat-w32.c.old	2019-02-18 19:09:21.643554112 +0100
++++ gnutls/gl/stat-w32.c	2019-02-18 19:15:28.651552712 +0100
+@@ -31,6 +31,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <windows.h>
++#include <winapifamily.h>
+ 
+ /* Specification.  */
+ #include "stat-w32.h"
+@@ -127,6 +128,10 @@
+ int
+ _gl_fstat_by_handle (HANDLE h, const char *path, struct stat *buf)
+ {
++#if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_APP)
++  errno = EINVAL;
++  return -1;
++#else
+   /* GetFileType
+      <https://msdn.microsoft.com/en-us/library/aa364960.aspx> */
+   DWORD type = GetFileType (h);
+@@ -414,6 +419,7 @@
+       }
+     return -1;
+   }
++#endif
+ }
+ 
+ #else
+diff --git gnutls/lib/str-iconv.c gnutls/lib/str-iconv.c
+index f5e3943e2..9606613e4 100644
+--- gnutls/lib/str-iconv.c
++++ gnutls/lib/str-iconv.c
+@@ -117,9 +117,8 @@ int _gnutls_ucs2_to_utf8(const void *data, size_t size,
+ 	return ret;
+ }
+ 
+-/* This is big-endian output only */
+ int _gnutls_utf8_to_ucs2(const void *data, size_t size,
+-			 gnutls_datum_t * output)
++			 gnutls_datum_t * output, unsigned be)
+ {
+ 	int ret;
+ 	size_t dstlen, nrm_size = 0, tmp_size = 0;
+@@ -150,7 +149,7 @@ int _gnutls_utf8_to_ucs2(const void *data, size_t size,
+ 	}
+ 
+ 	/* convert to BE */
+-	change_u16_endianness(dst, (uint8_t*)tmp_dst, dstlen, 1);
++	change_u16_endianness(dst, (uint8_t*)tmp_dst, dstlen, be);
+ 	dst[dstlen] = 0;
+ 	dst[dstlen+1] = 0;
+ 
+diff --git gnutls/lib/system.h gnutls/lib/system.h
+index 2e77322e1..ccae6475f 100644
+--- gnutls/lib/system.h
++++ gnutls/lib/system.h
+@@ -100,7 +100,7 @@ int _gnutls_find_config_path(char *path, size_t max_size);
+ int _gnutls_ucs2_to_utf8(const void *data, size_t size,
+ 			 gnutls_datum_t * output, unsigned bigendian);
+ int _gnutls_utf8_to_ucs2(const void *data, size_t size,
+-			 gnutls_datum_t * output);
++			 gnutls_datum_t * output, unsigned be);
+ 
+ void _gnutls_global_set_gettime_function(gnutls_gettime_func gettime_func);
+ 
+diff --git gnutls/lib/x509/pkcs12_encr.c gnutls/lib/x509/pkcs12_encr.c
+index 9d9c1d64a..76fbb4e8a 100644
+--- gnutls/lib/x509/pkcs12_encr.c
++++ gnutls/lib/x509/pkcs12_encr.c
+@@ -96,7 +96,7 @@ _gnutls_pkcs12_string_to_key(const mac_entry_st * me,
+ 				return gnutls_assert_val(GNUTLS_E_MEMORY_ERROR);
+ 			ucs2.size = 2;
+ 		} else {
+-			rc = _gnutls_utf8_to_ucs2(pw, pwlen, &ucs2);
++			rc = _gnutls_utf8_to_ucs2(pw, pwlen, &ucs2, 1);
+ 			if (rc < 0)
+ 				return gnutls_assert_val(rc);
+ 
+diff --git gnutls/lib/x509/verify-high2.c gnutls/lib/x509/verify-high2.c
+index f4a580bb0..6c7cf9901 100644
+--- gnutls/lib/x509/verify-high2.c
++++ gnutls/lib/x509/verify-high2.c
+@@ -45,6 +45,10 @@
+ # endif
+ #endif
+ 
++#ifdef _WIN32
++# include <tchar.h>
++#endif
++
+ /* Convenience functions for verify-high functionality 
+  */
+ 
+@@ -386,12 +390,14 @@ int load_dir_certs(const char *dirname,
+ 			  unsigned int tl_flags, unsigned int tl_vflags,
+ 			  unsigned type, unsigned crl)
+ {
+-	DIR *dirp;
+-	struct dirent *d;
+ 	int ret;
+ 	int r = 0;
+ 	char path[GNUTLS_PATH_MAX];
+ 
++#if !defined(_WIN32) || !defined(_UNICODE)
++	DIR *dirp;
++	struct dirent *d;
++
+ 	dirp = opendir(dirname);
+ 	if (dirp != NULL) {
+ 		do {
+@@ -422,7 +428,47 @@ int load_dir_certs(const char *dirname,
+ 		while (d != NULL);
+ 		closedir(dirp);
+ 	}
++#else /* _WIN32 */
+ 
++	_TDIR *dirp;
++	struct _tdirent *d;
++	gnutls_datum_t utf16 = {NULL, 0};
++
++	r = _gnutls_utf8_to_ucs2(dirname, strlen(dirname), &utf16);
++	if (r < 0)
++		return gnutls_assert_val(r);
++	dirp = _topendir((_TCHAR*)utf16.data);
++	gnutls_free(utf16.data);
++	if (dirp != NULL) {
++		do {
++			d = _treaddir(dirp);
++			if (d != NULL
++#ifdef _DIRENT_HAVE_D_TYPE
++				&& (d->d_type == DT_REG || d->d_type == DT_LNK || d->d_type == DT_UNKNOWN)
++#endif
++			) {
++				snprintf(path, sizeof(path), "%s/%S",
++					dirname, d->d_name);
++
++				if (crl != 0) {
++					ret =
++					    gnutls_x509_trust_list_add_trust_file
++					    (list, NULL, path, type, tl_flags,
++					     tl_vflags);
++				} else {
++					ret =
++					    gnutls_x509_trust_list_add_trust_file
++					    (list, path, NULL, type, tl_flags,
++					     tl_vflags);
++				}
++				if (ret >= 0)
++					r += ret;
++			}
++		}
++		while (d != NULL);
++		_tclosedir(dirp);
++	}
++#endif /* _WIN32 */
+ 	return r;
+ }
+
+diff --git gnutls/lib/x509/verify-high2.c gnutls/lib/x509/verify-high2.c
+index 6c7cf9901..6a48b05fc 100644
+--- gnutls/lib/x509/verify-high2.c
++++ gnutls/lib/x509/verify-high2.c
+@@ -434,7 +434,11 @@ int load_dir_certs(const char *dirname,
+ 	struct _tdirent *d;
+ 	gnutls_datum_t utf16 = {NULL, 0};
+ 
+-	r = _gnutls_utf8_to_ucs2(dirname, strlen(dirname), &utf16);
++#ifdef WORDS_BIGENDIAN
++	r = _gnutls_utf8_to_ucs2(dirname, strlen(dirname), &utf16, 1);
++#else
++	r = _gnutls_utf8_to_ucs2(dirname, strlen(dirname), &utf16, 0);
++#endif
+ 	if (r < 0)
+ 		return gnutls_assert_val(r);
+ 	dirp = _topendir((_TCHAR*)utf16.data);
+diff --git gnutls/lib/Makefile.am gnutls/lib/Makefile.am
+index e7c5c7f40e..f0a59c4bc2 100644
+--- gnutls/lib/Makefile.am
++++ gnutls/lib/Makefile.am
+@@ -200,7 +200,7 @@ DISTCLEANFILES += $(defexec_DATA)
+ endif
+ 
+ if WINDOWS
+-thirdparty_libadd += -lcrypt32
++thirdparty_libadd += -lcrypt32 -lbcrypt
+ endif
+ 
+ if MACOSX
+diff --git gnutls/lib/nettle/sysrng-windows.c gnutls/lib/nettle/sysrng-windows.c
+index 1e1305b4bd..677f4bcca1 100644
+--- gnutls/lib/nettle/sysrng-windows.c
++++ gnutls/lib/nettle/sysrng-windows.c
+@@ -46,16 +46,16 @@
+  */
+ 
+ #include <windows.h>
+-#include <wincrypt.h>
++#include <bcrypt.h>
+ 
+ get_entropy_func _rnd_get_system_entropy = NULL;
+ 
+-static HCRYPTPROV device_fd = 0;
++static BCRYPT_ALG_HANDLE device_fd = 0;
+ 
+ static
+ int _rnd_get_system_entropy_win32(void* rnd, size_t size)
+ {
+-	if (!CryptGenRandom(device_fd, (DWORD) size, rnd)) {
++	if (!BCRYPT_SUCCESS(BCryptGenRandom(device_fd, rnd, (DWORD) size, 0))) {
+ 		_gnutls_debug_log("Error in CryptGenRandom: %d\n",
+ 					(int)GetLastError());
+ 		return GNUTLS_E_RANDOM_DEVICE_ERROR;
+@@ -71,9 +71,8 @@ int _rnd_system_entropy_check(void)
+ 
+ int _rnd_system_entropy_init(void)
+ {
+-	if (!CryptAcquireContext
+-		(&device_fd, NULL, NULL, PROV_RSA_FULL,
+-		 CRYPT_SILENT | CRYPT_VERIFYCONTEXT)) {
++	if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider
++		(&device_fd, BCRYPT_RNG_ALGORITHM, MS_PRIMITIVE_PROVIDER, 0))) {
+ 		_gnutls_debug_log
+ 			("error in CryptAcquireContext!\n");
+ 		return GNUTLS_E_RANDOM_DEVICE_ERROR;
+@@ -85,5 +84,5 @@ int _rnd_system_entropy_init(void)
+ 
+ void _rnd_system_entropy_deinit(void)
+ {
+-	CryptReleaseContext(device_fd, 0);
++	BCryptCloseAlgorithmProvider(device_fd, 0);
+ }
+diff --git gnutls/lib/system/keys-win.c gnutls/lib/system/keys-win.c
+index eac511b975..ef93c95696 100644
+--- gnutls/lib/system/keys-win.c
++++ gnutls/lib/system/keys-win.c
+@@ -619,7 +619,6 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 	CRYPT_HASH_BLOB blob;
+ 	CRYPT_KEY_PROV_INFO *kpi = NULL;
+ 	NCRYPT_KEY_HANDLE nc = NULL;
+-	HCRYPTPROV hCryptProv = NULL;
+ 	NCRYPT_PROV_HANDLE sctx = NULL;
+ 	DWORD kpi_size;
+ 	SECURITY_STATUS r;
+@@ -750,6 +749,8 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 		}
+ 	} else {
+ 		/* this should be CAPI */
++		HCRYPTPROV hCryptProv = NULL;
++
+ 		_gnutls_debug_log
+ 		    ("error in opening CNG keystore: %x from %ls\n", (int)r,
+ 		     kpi->pwszProvName);
+@@ -780,6 +781,8 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 			ret =
+ 			    gnutls_assert_val
+ 			    (GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE);
++			if (hCryptProv != 0)
++				CryptReleaseContext(hCryptProv, 0);
+ 			goto cleanup;
+ 		}
+ 
+@@ -837,6 +840,7 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 						 (enc_too !=
+ 						  0) ? capi_decrypt : NULL,
+ 						 capi_deinit, capi_info, 0);
++		CryptReleaseContext(hCryptProv, 0);
+ 		if (ret < 0) {
+ 			gnutls_assert();
+ 			goto cleanup;
+@@ -847,8 +851,6 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 	if (ret < 0) {
+ 		if (nc != 0)
+ 			pNCryptFreeObject(nc);
+-		if (hCryptProv != 0)
+-			CryptReleaseContext(hCryptProv, 0);
+ 		gnutls_free(priv);
+ 	}
+ 	if (sctx != 0)
+diff --git gnutls/lib/system/keys-win.c gnutls/lib/system/keys-win.c
+index ef93c95696..93c0422c9b 100644
+--- gnutls/lib/system/keys-win.c
++++ gnutls/lib/system/keys-win.c
+@@ -44,7 +44,11 @@
+ #include <wincrypt.h>
+ #include <winbase.h>
+ 
++#if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP)
+ #define DYN_NCRYPT
++#else
++#include <ncrypt.h>
++#endif
+ 
+ #ifdef __MINGW32__
+ # include <_mingw.h>
+@@ -247,6 +251,8 @@ void *memrev(unsigned char *pvData, DWORD cbData)
+ 	return pvData;
+ }
+ 
++#if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP)
++
+ static
+ int capi_sign(gnutls_privkey_t key, void *userdata,
+ 	      const gnutls_datum_t * raw_data, gnutls_datum_t * signature)
+@@ -436,6 +442,8 @@ static int capi_info(gnutls_privkey_t key, unsigned int flags, void *userdata)
+ 	return -1;
+ }
+ 
++#endif /* #if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP) */
++
+ static
+ int cng_sign(gnutls_privkey_t key, void *userdata,
+ 	     const gnutls_datum_t * raw_data, gnutls_datum_t * signature)
+@@ -748,6 +756,7 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 			goto cleanup;
+ 		}
+ 	} else {
++#if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP)
+ 		/* this should be CAPI */
+ 		HCRYPTPROV hCryptProv = NULL;
+ 
+@@ -841,6 +850,7 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 						  0) ? capi_decrypt : NULL,
+ 						 capi_deinit, capi_info, 0);
+ 		CryptReleaseContext(hCryptProv, 0);
++#endif /* #if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP) */
+ 		if (ret < 0) {
+ 			gnutls_assert();
+ 			goto cleanup;
+diff --git gnutls/lib/system/keys-win.c gnutls/lib/system/keys-win.c
+index 93c0422c9b..6347743a26 100644
+--- gnutls/lib/system/keys-win.c
++++ gnutls/lib/system/keys-win.c
+@@ -604,6 +604,103 @@ static int cng_info(gnutls_privkey_t key, unsigned int flags, void *userdata)
+ 	return -1;
+ }
+ 
++#if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP)
++static int privkey_import_system_url_capi(gnutls_privkey_t pkey, const char *url, priv_st* priv, CRYPT_KEY_PROV_INFO *kpi)
++{
++	HCRYPTPROV hCryptProv = NULL;
++	int ret, enc_too = 0;
++	DWORD dwErrCode;
++
++	if (CryptAcquireContextW(&hCryptProv,
++				 kpi->pwszContainerName,
++				 kpi->pwszProvName,
++				 kpi->dwProvType, kpi->dwFlags)) {
++		for (DWORD i = 0; i < kpi->cProvParam; i++)
++			if (!CryptSetProvParam(hCryptProv,
++						   kpi->rgProvParam[i].
++						   dwParam,
++						   kpi->rgProvParam[i].
++						   pbData,
++						   kpi->rgProvParam[i].
++						   dwFlags)) {
++				dwErrCode = GetLastError();
++				break;
++			};
++	} else {
++		dwErrCode = GetLastError();
++	}
++
++	if (ERROR_SUCCESS != dwErrCode) {
++		_gnutls_debug_log
++			("error in getting cryptprov: %d from %s\n",
++			 (int)GetLastError(), url);
++		ret =
++			gnutls_assert_val
++			(GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE);
++		if (hCryptProv != 0)
++			CryptReleaseContext(hCryptProv, 0);
++		return ret;
++	}
++
++	{
++		BYTE buf[100 + sizeof(PROV_ENUMALGS_EX) * 2];
++		PROV_ENUMALGS_EX *pAlgo = (PROV_ENUMALGS_EX *) buf;
++		DWORD len = sizeof(buf);
++
++		if (CryptGetProvParam
++			(hCryptProv, PP_ENUMALGS_EX, buf, &len,
++			 CRYPT_FIRST)) {
++			DWORD hash = 0;
++			do {
++				switch (pAlgo->aiAlgid) {
++				case CALG_RSA_SIGN:
++					priv->pk = GNUTLS_PK_RSA;
++					enc_too = 1;
++					break;
++				case CALG_DSS_SIGN:
++					priv->pk =
++						priv->pk ==
++						GNUTLS_PK_RSA ?
++						GNUTLS_PK_RSA :
++						GNUTLS_PK_DSA;
++					break;
++				case CALG_SHA1:
++					hash = 1;
++					break;
++				case CALG_SHA_256:
++					hash = 256;
++					break;
++				default:
++					break;
++				}
++
++				len = sizeof(buf);	// reset the buffer size
++			} while (CryptGetProvParam
++				 (hCryptProv, PP_ENUMALGS_EX, buf, &len,
++				  CRYPT_NEXT));
++
++			if (priv->pk == GNUTLS_PK_DSA)
++				priv->sign_algo = GNUTLS_SIGN_DSA_SHA1;
++			else
++				priv->sign_algo =
++					(hash >
++					 1) ? GNUTLS_SIGN_RSA_SHA256 :
++					GNUTLS_SIGN_RSA_SHA1;
++		}
++	}
++
++	priv->hCryptProv = hCryptProv;
++	priv->dwKeySpec = kpi->dwKeySpec;
++
++	ret = gnutls_privkey_import_ext3(pkey, priv, capi_sign,
++					 (enc_too !=
++					  0) ? capi_decrypt : NULL,
++					 capi_deinit, capi_info, 0);
++	CryptReleaseContext(hCryptProv, 0);
++	return ret;
++}
++#endif
++
+ /*-
+  * _gnutls_privkey_import_system:
+  * @pkey: The private key
+@@ -634,7 +731,7 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 	WCHAR algo_str[64];
+ 	DWORD algo_str_size = 0;
+ 	priv_st *priv;
+-	DWORD i, dwErrCode = 0;
++	DWORD i;
+ 
+ 	if (ncrypt_init == 0)
+ 		return gnutls_assert_val(GNUTLS_E_UNIMPLEMENTED_FEATURE);
+@@ -756,100 +853,12 @@ int _gnutls_privkey_import_system_url(gnutls_privkey_t pkey, const char *url)
+ 			goto cleanup;
+ 		}
+ 	} else {
+-#if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP)
+ 		/* this should be CAPI */
+-		HCRYPTPROV hCryptProv = NULL;
+-
+ 		_gnutls_debug_log
+-		    ("error in opening CNG keystore: %x from %ls\n", (int)r,
+-		     kpi->pwszProvName);
+-
+-		if (CryptAcquireContextW(&hCryptProv,
+-					 kpi->pwszContainerName,
+-					 kpi->pwszProvName,
+-					 kpi->dwProvType, kpi->dwFlags)) {
+-			for (i = 0; i < kpi->cProvParam; i++)
+-				if (!CryptSetProvParam(hCryptProv,
+-						       kpi->rgProvParam[i].
+-						       dwParam,
+-						       kpi->rgProvParam[i].
+-						       pbData,
+-						       kpi->rgProvParam[i].
+-						       dwFlags)) {
+-					dwErrCode = GetLastError();
+-					break;
+-				};
+-		} else {
+-			dwErrCode = GetLastError();
+-		}
+-
+-		if (ERROR_SUCCESS != dwErrCode) {
+-			_gnutls_debug_log
+-			    ("error in getting cryptprov: %d from %s\n",
+-			     (int)GetLastError(), url);
+-			ret =
+-			    gnutls_assert_val
+-			    (GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE);
+-			if (hCryptProv != 0)
+-				CryptReleaseContext(hCryptProv, 0);
+-			goto cleanup;
+-		}
+-
+-		{
+-			BYTE buf[100 + sizeof(PROV_ENUMALGS_EX) * 2];
+-			PROV_ENUMALGS_EX *pAlgo = (PROV_ENUMALGS_EX *) buf;
+-			DWORD len = sizeof(buf);
+-
+-			if (CryptGetProvParam
+-			    (hCryptProv, PP_ENUMALGS_EX, buf, &len,
+-			     CRYPT_FIRST)) {
+-				DWORD hash = 0;
+-				do {
+-					switch (pAlgo->aiAlgid) {
+-					case CALG_RSA_SIGN:
+-						priv->pk = GNUTLS_PK_RSA;
+-						enc_too = 1;
+-						break;
+-					case CALG_DSS_SIGN:
+-						priv->pk =
+-						    priv->pk ==
+-						    GNUTLS_PK_RSA ?
+-						    GNUTLS_PK_RSA :
+-						    GNUTLS_PK_DSA;
+-						break;
+-					case CALG_SHA1:
+-						hash = 1;
+-						break;
+-					case CALG_SHA_256:
+-						hash = 256;
+-						break;
+-					default:
+-						break;
+-					}
+-
+-					len = sizeof(buf);	// reset the buffer size
+-				} while (CryptGetProvParam
+-					 (hCryptProv, PP_ENUMALGS_EX, buf, &len,
+-					  CRYPT_NEXT));
+-
+-				if (priv->pk == GNUTLS_PK_DSA)
+-					priv->sign_algo = GNUTLS_SIGN_DSA_SHA1;
+-				else
+-					priv->sign_algo =
+-					    (hash >
+-					     1) ? GNUTLS_SIGN_RSA_SHA256 :
+-					    GNUTLS_SIGN_RSA_SHA1;
+-			}
+-		}
+-
+-		priv->hCryptProv = hCryptProv;
+-		priv->dwKeySpec = kpi->dwKeySpec;
+-
+-		ret = gnutls_privkey_import_ext3(pkey, priv, capi_sign,
+-						 (enc_too !=
+-						  0) ? capi_decrypt : NULL,
+-						 capi_deinit, capi_info, 0);
+-		CryptReleaseContext(hCryptProv, 0);
++			("error in opening CNG keystore: %x from %ls\n", (int)r,
++			 kpi->pwszProvName);
++#if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP)
++		ret = privkey_import_system_url_capi(pkey, url, priv, kpi);
+ #endif /* #if WINAPI_FAMILY_PARTITION (WINAPI_PARTITION_DESKTOP) */
+ 		if (ret < 0) {
+ 			gnutls_assert();
